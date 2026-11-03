@@ -38,49 +38,37 @@ window.dataSdk = {
         return { isOk: true, mode: this.mode, syncedPendingOps: synced.replayed || 0 };
       }
 
-      console.warn('[DataSDK] Falha ao sincronizar com API. Usando localStorage.', synced.error && synced.error.message);
-      this.mode = 'local';
-    }
-
-    if (!this.storageAvailable) {
-      console.warn('[DataSDK] localStorage indisponivel. Dados nao serao persistidos.');
+      console.warn('[DataSDK] API indisponível. Dados locais não serão usados como fonte de verdade.', synced.error && synced.error.message);
+      this.mode = 'unavailable';
       this.data = [];
       this.notifyDataChanged();
-      return { isOk: true, warning: 'Local storage unavailable', mode: this.mode };
+      return { isOk: false, error: { message: 'Não foi possível conectar ao servidor. Os dados não foram carregados.' } };
     }
 
-    const loaded = this.loadFromLocal();
-    if (!loaded.isOk) {
-      console.warn('[DataSDK] Falha ao carregar localStorage:', loaded.error && loaded.error.message);
-    }
-
+    this.data = [];
     this.notifyDataChanged();
-    return { isOk: true, mode: this.mode };
+    return { isOk: false, error: { message: 'Servidor indisponível. Conecte-se novamente para acessar os dados.' } };
   },
 
   create: async function(item) {
     const safeItem = { ...item, __backendId: item && item.__backendId ? item.__backendId : this.generateId() };
 
-    if (this.mode === 'api') {
-      const remote = await this.request('/api/records', {
-        method: 'POST',
-        body: JSON.stringify(safeItem)
-      });
-
-      if (remote.isOk) {
-        this.data.push(remote.data || safeItem);
-        this.notifyDataChanged();
-        return { isOk: true, mode: this.mode };
-      }
-
-      if (this.shouldFallbackToOffline(remote)) {
-        return this.applyOfflineCreate(safeItem, true, remote.error && remote.error.message);
-      }
-
-      return remote;
+    if (this.mode !== 'api') {
+      return this.applyOfflineCreate(safeItem, true, 'Servidor indisponível');
     }
 
-    return this.applyOfflineCreate(safeItem, true);
+    const remote = await this.request('/api/records', {
+      method: 'POST',
+      body: JSON.stringify(safeItem)
+    });
+
+    if (remote.isOk) {
+      this.data.push(remote.data || safeItem);
+      this.notifyDataChanged();
+      return { isOk: true, mode: this.mode };
+    }
+
+    return remote;
   },
 
   update: async function(item) {
@@ -91,26 +79,22 @@ window.dataSdk = {
 
     const safeItem = { ...item };
 
-    if (this.mode === 'api') {
-      const remote = await this.request('/api/records/' + encodeURIComponent(safeItem.__backendId), {
-        method: 'PUT',
-        body: JSON.stringify(safeItem)
-      });
-
-      if (remote.isOk) {
-        this.data[index] = remote.data || safeItem;
-        this.notifyDataChanged();
-        return { isOk: true, mode: this.mode };
-      }
-
-      if (this.shouldFallbackToOffline(remote)) {
-        return this.applyOfflineUpdate(index, safeItem, true, remote.error && remote.error.message);
-      }
-
-      return remote;
+    if (this.mode !== 'api') {
+      return this.applyOfflineUpdate(index, safeItem, true, 'Servidor indisponível');
     }
 
-    return this.applyOfflineUpdate(index, safeItem, true);
+    const remote = await this.request('/api/records/' + encodeURIComponent(safeItem.__backendId), {
+      method: 'PUT',
+      body: JSON.stringify(safeItem)
+    });
+
+    if (remote.isOk) {
+      this.data[index] = remote.data || safeItem;
+      this.notifyDataChanged();
+      return { isOk: true, mode: this.mode };
+    }
+
+    return remote;
   },
 
   delete: async function(item) {
@@ -119,25 +103,21 @@ window.dataSdk = {
       return { isOk: false, error: { message: 'Item not found' } };
     }
 
-    if (this.mode === 'api') {
-      const remote = await this.request('/api/records/' + encodeURIComponent(item.__backendId), {
-        method: 'DELETE'
-      });
-
-      if (remote.isOk) {
-        this.data.splice(index, 1);
-        this.notifyDataChanged();
-        return { isOk: true, mode: this.mode };
-      }
-
-      if (this.shouldFallbackToOffline(remote)) {
-        return this.applyOfflineDelete(index, item, true, remote.error && remote.error.message);
-      }
-
-      return remote;
+    if (this.mode !== 'api') {
+      return this.applyOfflineDelete(index, item, true, 'Servidor indisponível');
     }
 
-    return this.applyOfflineDelete(index, item, true);
+    const remote = await this.request('/api/records/' + encodeURIComponent(item.__backendId), {
+      method: 'DELETE'
+    });
+
+    if (remote.isOk) {
+      this.data.splice(index, 1);
+      this.notifyDataChanged();
+      return { isOk: true, mode: this.mode };
+    }
+
+    return remote;
   },
 
   applyOfflineCreate: function(item, queueForSync, reasonMessage) {
@@ -456,6 +436,23 @@ window.dataSdk = {
     return 'CollaboratorData::pendingOps';
   },
 
+  getCurrentUser: function() {
+    try {
+      return String(sessionStorage.getItem('loggedUser') || 'anonymous').trim().toUpperCase().replace(/[^A-Z0-9._-]/g, '_');
+    } catch (_) {
+      return 'anonymous';
+    }
+  },
+
+  apiUnavailableResult: function() {
+    return {
+      isOk: true,
+      mode: 'local',
+      queued: true,
+      warning: 'Servidor indisponível. A alteração foi salva localmente e será sincronizada quando a conexão voltar.'
+    };
+  },
+
   migrateLegacyStorageKeys: function() {
     if (!this.storageAvailable) return;
     try {
@@ -625,7 +622,10 @@ window.dataSdk = {
     }
 
     var self = this;
-    var es = new EventSource(this.apiBaseUrl + '/api/events');
+    var token = '';
+    try { token = sessionStorage.getItem('authToken') || ''; } catch (_) { /* ignore */ }
+    var eventUrl = this.apiBaseUrl + '/api/events?token=' + encodeURIComponent(token);
+    var es = new EventSource(eventUrl);
 
     es.onmessage = function(e) {
       try {
